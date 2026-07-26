@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+src/build-info.js
+
+# локальные настройки окружения (адрес сервера и т.п.)
+.env
+.env.local
+.env.*.local
+
+# артефакты тестов
+test-results/
+playwright-report/

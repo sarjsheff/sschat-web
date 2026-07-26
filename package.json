@@ -1,0 +1,25 @@
+{
+  "name": "sschat-web",
+  "private": true,
+  "version": "0.2.3",
+  "description": "Веб-клиент мессенджера sschat: E2E-шифрование, Web Components + Lit, Tauri-шелл",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "for f in test/*.mjs; do node \"$f\" || exit 1; done"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.2.0",
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
+    "idb-keyval": "^6.2.1",
+    "jsdom": "^29.1.1",
+    "lit": "^3.2.0"
+  },
+  "devDependencies": {
+    "vite": "^6.3.3"
+  }
+}
