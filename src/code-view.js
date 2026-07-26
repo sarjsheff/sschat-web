@@ -60,8 +60,9 @@ class CodeView extends LitElement {
     } catch (e) { this._error = String(e); this._busy = false; }
   }
 
-  async _cancel() {
-    try { await api.cancelLogin(); } catch {}
+  // Серверного отзыва challenge нет — просто возвращаемся на экран входа,
+  // код протухнет сам.
+  _cancel() {
     this.dispatchEvent(new CustomEvent('code:cancel', { bubbles: true, composed: true }));
   }
 }

@@ -35,36 +35,52 @@ npm run build             # сборка в dist/
 ## Тесты
 
 ```sh
-node test/chat-view-scroll-test.mjs
-node test/chat-view-scroll-anchor-test.mjs
-node test/chat-view-scroll-wkwebview-test.mjs
-node test/apns-publish-test.mjs
+npm test          # все разом
 ```
 
-Все четыре автономны: стабят DOM и импортируют настоящие модули, сервер не
-нужен. Три из них - регрессионные тесты скролла ленты, включая модель WKWebView,
-где `querySelector` по атрибуту в Shadow DOM не находит существующие строки.
+Пять наборов, все автономны - стабят DOM и импортируют настоящие модули, сервер
+не нужен:
+
+| Файл | Что проверяет |
+|---|---|
+| `chat-view-scroll-test.mjs` | виртуальное окно ленты: сдвиг, вставка, границы |
+| `chat-view-scroll-anchor-test.mjs` | лента не прыгает при подгрузке истории |
+| `chat-view-scroll-wkwebview-test.mjs` | то же в модели WKWebView, где `querySelector` по атрибуту в Shadow DOM не находит существующие строки |
+| `apns-publish-test.mjs` | дедупликация APNs-токена по паре (устройство, токен) |
+| `lib-test.mjs` | разметка сообщений, раскладка альбомов, форматтеры |
 
 ## Структура
 
 ```
 src/
-  sschat-app.js     корневой компонент, стадии loading → login → code → main
-  login-view.js     вход по логину/паролю
-  code-view.js      подтверждение кодом
-  sidebar-view.js   список комнат
-  chat-view.js      лента сообщений: виртуальное окно, пагинация, E2E
-  room-info.js      участники и настройки комнаты
-  settings-view.js  профиль, тема, размер шрифта
-  api.js            HTTP-клиент
-  sse.js            SSE с exponential backoff
-  crypto.js         X25519 + HKDF + AES-GCM
-  identity.js       ключи устройства в IndexedDB
-  room-key.js       получение и кеш комнатных ключей
-  cache.js          офлайн-кеш сообщений, комнат, пользователей
-  viewport.js       расчет видимого окна ленты
-src-tauri/          Tauri-шелл, APNs-мост для iOS
+  main.js             точка входа: тема, размер шрифта, viewport под клавиатуру iOS
+  sschat-app.js       корневой компонент, стадии loading → login → code → main
+  config.js           адрес сервера — единственный источник
+  api.js              HTTP-клиент
+  sse.js              SSE с exponential backoff
+
+  login-view.js       вход по логину/паролю
+  code-view.js        подтверждение кодом
+  sidebar-view.js     список комнат
+  chat-view.js        лента: виртуальное окно, пагинация, вложения, лайтбокс
+  chat-view.css.js    стили ленты
+  room-info.js        участники, боты, аватар, удаление комнаты
+  settings-view.js    профиль, устройства, боты, тема, размер шрифта
+
+  crypto.js           X25519 + HKDF + AES-GCM
+  identity.js         ключи устройства в IndexedDB
+  room-key.js         получение и кеш комнатных ключей
+  cache.js            офлайн-кеш сообщений и имён
+
+  lib/html.js         экранирование и markdown сообщений
+  lib/format.js       даты, размеры, определение типа вложения
+  lib/album-layout.js мозаичная раскладка альбомов
+  lib/ui/             s-button, s-input
+src-tauri/            Tauri-шелл, APNs-мост для iOS
 ```
+
+Модули в `lib/` — чистые функции без DOM и состояния, поэтому проверяются
+напрямую из node (`test/lib-test.mjs`).
 
 ## Шифрование
 

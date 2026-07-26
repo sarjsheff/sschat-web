@@ -3,13 +3,16 @@
 // Отладка: node test/viewport-node.mjs (терминал), потом браузер.
 
 import { decryptBody, encryptBody, decryptBlob, encryptBlob } from './crypto.js';
+import { getBase } from './config.js';
+import { CHAT_VIEW_CSS } from './chat-view.css.js';
+import { escapeHtml, renderMarkdown } from './lib/html.js';
+import { albumLayout, fitDimensions } from './lib/album-layout.js';
+import { formatSize, dayKey, dayLabel, attKind, mimeFor } from './lib/format.js';
 
 const SLICE = 40;   // шаг сдвига окна (MESSAGE_LIST_SLICE)
 const LIMIT = 80;   // максимум сообщений в DOM (MESSAGE_LIST_VIEWPORT_LIMIT)
 const TYPING_TTL = 6000;       // мс без обновления → «перестал печатать» (как typing.svelte.js)
 const TYPING_THROTTLE = 3000;  // не чаще раза в N мс шлём свой POST /typing
-const DEFAULT_BASE = import.meta.env?.VITE_API_BASE || '';   // см. .env.example
-const BASE = (() => { try { return localStorage.getItem('sschat-base-url') || DEFAULT_BASE; } catch { return DEFAULT_BASE; } })();
 
 class ChatView extends HTMLElement {
   // ── observed attrs ───────────────────────────────────────
@@ -84,7 +87,7 @@ class ChatView extends HTMLElement {
   async _doDelete(id) {
     this._menuFor = null; this._delConfirm = null;
     try {
-      const r = await fetch(BASE + `/rooms/${this._roomId}/messages/${id}`, {
+      const r = await fetch(getBase() + `/rooms/${this._roomId}/messages/${id}`, {
         method: 'DELETE', headers: { Authorization: 'Bearer ' + this._token }
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -131,7 +134,7 @@ class ChatView extends HTMLElement {
     const now = Date.now();
     if (now - this._lastTypingSent < TYPING_THROTTLE) return;
     this._lastTypingSent = now;
-    fetch(BASE + `/rooms/${this._roomId}/typing`, {
+    fetch(getBase() + `/rooms/${this._roomId}/typing`, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + this._token, 'Content-Type': 'application/json' },
       body: '{}'
@@ -155,17 +158,17 @@ class ChatView extends HTMLElement {
       const { getCachedUser, putCachedUser } = await import('./cache.js');
       const cached = await getCachedUser(id);
       if (cached) {
-        fetch(BASE + `/users/${id}`, { headers: { Authorization: 'Bearer ' + this._token } })
+        fetch(getBase() + `/users/${id}`, { headers: { Authorization: 'Bearer ' + this._token } })
           .then(r => r.ok ? r.json() : null).then(u => { if (u) putCachedUser(u); }).catch(() => {});
         return cached;
       }
-      const r = await fetch(BASE + `/users/${id}`, { headers: { Authorization: 'Bearer ' + this._token } });
+      const r = await fetch(getBase() + `/users/${id}`, { headers: { Authorization: 'Bearer ' + this._token } });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const u = await r.json();
       putCachedUser(u);
       return u;
     } catch (e) {
-      const r = await fetch(BASE + `/users/${id}`, { headers: { Authorization: 'Bearer ' + this._token } });
+      const r = await fetch(getBase() + `/users/${id}`, { headers: { Authorization: 'Bearer ' + this._token } });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.json();
     }
@@ -285,7 +288,7 @@ class ChatView extends HTMLElement {
   }
 
   _markRead(msgId) {
-    fetch(BASE + `/rooms/${this._roomId}/read`, {
+    fetch(getBase() + `/rooms/${this._roomId}/read`, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + this._token, 'Content-Type': 'application/json' },
       body: JSON.stringify({ msg_id: msgId })
@@ -403,7 +406,7 @@ class ChatView extends HTMLElement {
 
   // ── API ──────────────────────────────────────────────────
   async _api(path) {
-    const r = await fetch(BASE + path, {
+    const r = await fetch(getBase() + path, {
       headers: { Authorization: 'Bearer ' + this._token }
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -525,8 +528,8 @@ class ChatView extends HTMLElement {
       if (m._pending) return this._pendingHtml(m); // оптимистичное превью отправки
 
       const prev = i > 0 ? msgs[i-1] : null;
-      const daySep = !prev || this._dayKey(m.created_at) !== this._dayKey(prev.created_at)
-        ? `<div class="day-sep">${this._dayLabel(m.created_at)}</div>` : '';
+      const daySep = !prev || dayKey(m.created_at) !== dayKey(prev.created_at)
+        ? `<div class="day-sep">${dayLabel(m.created_at)}</div>` : '';
 
       const nameStr = mine ? (this.names[m.user_id] ?? 'Вы') : (this.names[m.user_id] ?? m.user_id.slice(0,8));
       const dec = this._decrypt(m.body, m._plaintext);
@@ -535,15 +538,15 @@ class ChatView extends HTMLElement {
       let attHtml = '';
       if (att) {
         // Картинки → мозаика-галерея; видео/аудио/файлы → карточки/плееры списком
-        const visual = att.atts.filter(a => this._attKind(a) === 'image');
-        const other = att.atts.filter(a => this._attKind(a) !== 'image');
+        const visual = att.atts.filter(a => attKind(a) === 'image');
+        const other = att.atts.filter(a => attKind(a) !== 'image');
         if (visual.length === 1) {
-          const a0 = visual[0], d = this._imgDims(a0.w, a0.h);
+          const a0 = visual[0], d = fitDimensions(a0.w, a0.h);
           const st = d ? `width:${d.w}px;height:${d.h}px` : 'width:200px;height:160px';
           attHtml += this._attBoxHtml(a0, st);
         } else if (visual.length > 1) {
           const ratios = visual.map(a => (a.w && a.h) ? a.w / a.h : 1);
-          const lay = this._albumLayout(ratios);
+          const lay = albumLayout(ratios);
           attHtml += `<div class="att-gallery" style="position:relative;width:${lay.width}px;height:${lay.height}px">${
             visual.map((a, i) => {
               const r = lay.items[i];
@@ -568,7 +571,7 @@ class ChatView extends HTMLElement {
               <button class="msg-menu-btn" data-act="menu" data-id="${m.id}" title="Меню">⋮</button>
             </div>
             ${attHtml ? `<div class="att-wrap">${attHtml}</div>` : ''}
-            ${text ? `<div class="msg-text">${this._md(text)}</div>` : ''}
+            ${text ? `<div class="msg-text">${renderMarkdown(text)}</div>` : ''}
             <span class="time">${encrypted ? '' : '<span class="plaintext-badge" title="Незашифрованно">🔓</span>'}${edited}${time}${mine ? (m._sending
               ? '<span class="status sending" title="Отправляется">🕐</span>'
               : m._failed
@@ -680,138 +683,11 @@ ${Array.from({length:6}, (_,i) => {
   // Статический каркас: style/header/#scroll(#sent-top/#list/#sent-bottom)/fab/input.
   _buildShell() {
     this._root.innerHTML = `
-      <style>
-        :host { display: flex; flex-direction: column; height: 100%; background: var(--bg,#0f0f23); color: var(--fg,#eee); font: 14px system-ui; position: relative; }
-        .header { padding: 8px 14px; border-bottom: 1px solid #ddd; background: #fff; color: #000; display: flex; align-items: center; gap: 8px; cursor: pointer; flex-shrink: 0; }
-        .back-btn { flex: 0 0 auto; width: 30px; height: 30px; padding: 0; margin: 0; border: none; background: none; color: #000; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; border-radius: 6px; }
-        .back-btn:hover { background: rgba(0,0,0,.06); }
-        .head-avatar { width: 32px; height: 32px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
-        .head-text { min-width: 0; flex: 1; }
-        .room-name { font-weight: 600; }
-        .scroll { flex: 1; overflow-y: auto; overflow-anchor: none; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px;
-          background-color: rgb(153, 186, 146); background-position: 50% 50%; background-repeat: no-repeat; background-size: 100% 100%; }
-        .scroll.drag-over { outline: 3px dashed #4a9eff; outline-offset: -6px; }
-        /* ширина колонки сообщений как telegram-tt: 728px до 1920px, ≥1921px → 50vw */
-        #list { display: flex; flex-direction: column; gap: 2px; width: 100%; max-width: 728px; margin: 0 auto; box-sizing: border-box; }
-        @media (min-width: 1921px) { #list { max-width: 50vw; } }
-        #list > :first-child { margin-top: auto; }
-        /* Строка сжимается по содержимому (бабл+кнопка) и прижимается к краю целиком */
-        .msg-row { display: flex; align-items: center; gap: 4px; position: relative; max-width: 88%; }
-        .msg-row.mine { align-self: flex-end; }
-        .msg-row.their { align-self: flex-start; }
-        .chat-bubble { padding: 6px 10px; border-radius: 8px; background: #fff; color: #000; position: relative; box-sizing: border-box; min-width: 80px; }
-        /* бабл с картинкой — по размеру картинки. .mine:has (0,3,0) перебивает .chat-bubble.mine{max-width:80%} */
-        .chat-bubble:has(.att-wrap), .chat-bubble.mine:has(.att-wrap) { max-width: none; }
-        .bubble-head { display: flex; align-items: center; gap: 6px; width: 100%; }
-        .bubble-head .name { min-width: 0; }
-        /* глобальный CSS приложения навязывает кнопке position:absolute — перебиваем */
-        .bubble-head .msg-menu-btn { position: static !important; left: auto !important; right: auto !important; flex: 0 0 auto; margin-left: auto; }
-        .msg-menu-btn { flex: 0 0 auto; width: 22px; height: 22px; min-width: 22px; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; opacity: .6; background: none; border: none; color: #000; font-size: 16px; line-height: 1; cursor: pointer; padding: 0; margin: 0; border-radius: 4px; }
-        .msg-menu-btn:hover { opacity: 1; background: rgba(0,0,0,.08); }
-        .msg-menu { position: fixed; top: 0; left: 0; z-index: 1000; display: flex; flex-direction: column; background: #23234a; border: 1px solid #3a3a6a; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,.5); overflow: hidden; min-width: 130px; }
-        .msg-menu button { background: none; border: none; color: #eee; text-align: left; padding: 8px 12px; cursor: pointer; font-size: 13px; white-space: nowrap; }
-        .msg-menu button:hover { background: #0f3460; }
-        .msg-menu button.danger { color: #ff8080; }
-        .edited { font-size: 9px; color: #777; font-style: italic; }
-        .chat-bubble.mine { background: rgb(220, 248, 197); color: #000; }
-        .chat-bubble.plaintext { border-left: 3px solid #f4a236; }
-        /* Анимация нового сообщения — выплывает снизу как в Telegram Web */
-        .msg-row.new-msg { animation: msgSlideIn 0.25s ease-out; }
-        @keyframes msgSlideIn {
-          from { opacity: 0; transform: translateY(12px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-        .plaintext-badge { font-size: 11px; margin-right: 2px; opacity: .8; }
-        /* Skeleton loading — мерцающие плейсхолдеры как в Telegram Web */
-        .skeleton-list { display: flex; flex-direction: column; gap: 6px; padding: 8px 0; max-width: 728px; margin: 0 auto; width: 100%; }
-        .skel-msg { display: flex; flex-direction: column; gap: 4px; padding: 8px 12px; border-radius: 8px; background: rgba(255,255,255,.4); max-width: 88%; }
-        .skel-bar { height: 10px; border-radius: 4px; background: rgba(255,255,255,.7); }
-        .skel-msg, .skel-bar { animation: skelPulse 1.5s ease-in-out infinite; }
-        .skel-bar:nth-child(2) { margin-top: 4px; width: 80% !important; opacity: .6; }
-        @keyframes skelPulse {
-          0%, 100% { opacity: 0.4; }
-          50% { opacity: 0.8; }
-        }
-        .name { font-size: 13px; color: #7eb8ff; margin-bottom: 2px; }
-        .msg-text { word-break: break-word; white-space: pre-wrap; }
-        .msg-text code { background: rgba(0,0,0,.08); padding: 1px 4px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: .92em; }
-        .msg-text pre { background: rgba(0,0,0,.08); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 4px 0; white-space: pre; font-family: ui-monospace, monospace; font-size: .9em; }
-        .msg-text a { color: #1a73e8; text-decoration: none; }
-        .msg-text a:hover { text-decoration: underline; }
-        .msg-text s { opacity: .7; }
-        .msg-text .spoiler { background: #555; color: transparent; border-radius: 3px; cursor: pointer; transition: color .15s; }
-        .msg-text .spoiler.revealed { background: rgba(0,0,0,.08); color: inherit; }
-        .att-wrap { display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px; }
-        .att-box { position: relative; border-radius: 6px; overflow: hidden; background: #1e2a4a; cursor: pointer; }
-        /* Галерея-мозаика (альбомы, как telegram-tt) — абсолютное позиционирование из _albumLayout */
-        .att-gallery { border-radius: 8px; overflow: hidden; }
-        .att-gallery .att-box { border-radius: 0; }
-        .att-blur { position: absolute; inset: 0; z-index: 0; background-size: cover; background-position: center; filter: blur(12px); transform: scale(1.15); }
-        .att-img { position: relative; z-index: 1; width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; }
-        .att-img.shown { opacity: 1; }
-        .att-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,.15); }
-        .att-progress.hidden { display: none; }
-        .att-bar { height: 100%; width: 0; background: #4a9eff; transition: width .12s linear; }
-        .att-media { max-width: 280px; max-height: 320px; border-radius: 6px; display: block; }
-        .att-file { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: rgba(0,0,0,.06); border-radius: 8px; cursor: pointer; max-width: 260px; }
-        .att-file:hover { background: rgba(0,0,0,.12); }
-        .att-file-icon { flex: 0 0 auto; width: 38px; height: 38px; border-radius: 8px; background: #4a9eff; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
-        .att-file-meta { min-width: 0; }
-        .att-file-name { font-size: 13px; color: #000; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .att-file-size { font-size: 11px; color: #666; }
-        .att-broken { background: #3a2030; }
-        .att-fail { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #ff9090; font-size: 12px; pointer-events: none; }
-        .att-sending { position: relative; opacity: .75; }
-        .sending-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,.35); color: #fff; font-size: 13px; border-radius: 6px; pointer-events: none; }
-        .lightbox { position: fixed; inset: 0; z-index: 2000; background: rgba(0,0,0,.88); display: none; align-items: center; justify-content: center; cursor: zoom-out; }
-        .lightbox.visible { display: flex; }
-        .lb-img { max-width: 92vw; max-height: 92vh; object-fit: contain; border-radius: 4px; cursor: grab; will-change: transform; touch-action: none; }
-        .lb-spinner { color: #ccc; font-size: 14px; }
-        .lb-close, .lb-nav { box-sizing: border-box; padding: 0; margin: 0; border: none; border-radius: 50%; background: rgba(255,255,255,.15); color: #fff; cursor: pointer; z-index: 2; display: flex; align-items: center; justify-content: center; -webkit-appearance: none; }
-        .lb-close:hover, .lb-nav:hover { background: rgba(255,255,255,.28); }
-        .lb-close { position: fixed; top: calc(16px + env(safe-area-inset-top, 0px)); right: 20px; width: 40px; height: 40px; }
-        .lb-nav { position: fixed; top: 50%; transform: translateY(-50%); width: 48px; height: 48px; }
-        .lb-prev { left: 20px; }
-        .lb-next { right: 20px; }
-        .send-dialog { position: fixed; inset: 0; z-index: 2100; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; }
-        .send-dialog.visible { display: flex; }
-        .sd-box { background: #1a1a2e; border: 1px solid #333; border-radius: 12px; padding: 16px; width: min(420px, 90vw); max-height: 86vh; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 8px 32px rgba(0,0,0,.6); }
-        .sd-title { font-weight: 600; font-size: 15px; }
-        .sd-previews { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; overflow-y: auto; }
-        .sd-item { position: relative; }
-        .sd-thumb { max-width: 120px; max-height: 160px; border-radius: 8px; object-fit: cover; background: #0d0d20; display: block; }
-        .sd-fileicon { width: 110px; height: 90px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; background: #2a2a40; color: #fff; font-weight: 700; font-size: 13px; padding: 6px; }
-        .sd-fileicon span { font-weight: 400; font-size: 11px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .sd-del { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; box-sizing: border-box; padding: 0; margin: 0; border-radius: 50%; border: none; background: rgba(0,0,0,.6); color: #fff; font: 16px/1 system-ui; cursor: pointer; display: flex; align-items: center; justify-content: center; text-align: center; }
-        .sd-del:hover { background: rgba(220,40,40,.9); }
-        .sd-add { align-self: flex-start; cursor: pointer; color: #4a9eff; font-size: 13px; user-select: none; }
-        .sd-caption { padding: 10px 12px; border-radius: 8px; border: 1px solid #333; background: #0f0f23; color: #eee; font-size: 14px; }
-        .sd-actions { display: flex; gap: 8px; justify-content: flex-end; }
-        .sd-actions button { padding: 8px 18px; border-radius: 8px; border: none; cursor: pointer; font-size: 14px; }
-        .sd-cancel { background: #2a2a40; color: #ccc; }
-        .sd-send { background: #4a9eff; color: #fff; font-weight: 600; }
-        .time { font-size: 10px; color: rgb(69, 175, 84); float: right; margin-left: 8px; }
-        .status { color: rgb(69, 175, 84); margin-left: 2px; }
-        .status.read { color: rgb(69, 175, 84); font-weight: 600; letter-spacing: -0.35em; padding-right: 0.35em; } /* ✓✓ наползают */
-        .status.sending { color: #999; font-size: 10px; } /* часики — отправляется */
-        .status.failed { color: #e55; font-weight: 600; } /* не отправлено */
-        .day-sep { text-align: center; font-size: 11px; color: #555; padding: 8px 0; }
-        .loading { text-align: center; padding: 20px; color: #555; }
-        .typing { min-height: 14px; font-size: 12px; color: #7eb8ff; font-style: italic; }
-        .input-row { display: flex; gap: 6px; padding: 8px 10px; border-top: 1px solid #ddd; background: #fff; align-items: center; flex-shrink: 0; }
-        .att-btn { flex: 0 0 auto; cursor: pointer; font-size: 20px; opacity: .7; user-select: none; padding: 0 4px; }
-        .att-btn:hover { opacity: 1; }
-        .input-row textarea { flex: 1; padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; background: #f5f5f5; color: #000; font: inherit; resize: none; line-height: 1.3; max-height: 120px; overflow-y: auto; }
-        .input-row button { padding: 8px 16px; border-radius: 6px; border: none; background: #0f3460; color: #eee; cursor: pointer; }
-        .fab { position: absolute; bottom: 70px; right: 28px; width: 40px; height: 40px; border-radius: 50%; background: #4a9eff; border: none; color: #fff; font-size: 20px; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.5); display: none; z-index: 10; }
-        .fab.has-count { font-size: 14px; font-weight: 600; }
-        .fab:hover { background: #6cb0ff; }
-        .fab.visible { display: flex; align-items: center; justify-content: center; }
-      </style>
+      <style>${CHAT_VIEW_CSS}</style>
       <div class="header" id="header">
         <button class="back-btn" id="back" title="К списку комнат"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>
         <img class="head-avatar" id="head-avatar" src="" alt="" style="display:none" />
-        <div class="head-text"><div class="room-name">${this._escapeHtml(this._roomName || this.getAttribute('roomname') || this._roomId.slice(0,12))}</div><div class="typing" id="typing"></div></div>
+        <div class="head-text"><div class="room-name">${escapeHtml(this._roomName || this.getAttribute('roomname') || this._roomId.slice(0,12))}</div><div class="typing" id="typing"></div></div>
       </div>
       <div class="scroll" id="scroll"><div id="sent-top" style="height:1px"></div><div id="loadstate"></div><div id="list"></div><div id="sent-bottom" style="height:1px"></div></div>
       <button class="fab" id="fab" title="Вниз">↓</button>
@@ -923,7 +799,7 @@ ${Array.from({length:6}, (_,i) => {
 
       if (editingId) {
         try {
-          const resp = await fetch(BASE + `/rooms/${this._roomId}/messages/${editingId}`, {
+          const resp = await fetch(getBase() + `/rooms/${this._roomId}/messages/${editingId}`, {
             method: 'PATCH',
             headers: { 'Authorization': 'Bearer ' + this._token, 'Content-Type': 'application/json' },
             body: JSON.stringify({ body })
@@ -941,7 +817,7 @@ ${Array.from({length:6}, (_,i) => {
       this.messages.push(pmsg);
       this._updateViewport('bottom'); this._render(); this._scrollBottom();
       try {
-        const resp = await fetch(BASE + `/rooms/${this._roomId}/messages`, {
+        const resp = await fetch(getBase() + `/rooms/${this._roomId}/messages`, {
           method: 'POST',
           headers: { 'Authorization': 'Bearer ' + this._token, 'Content-Type': 'application/json' },
           body: JSON.stringify({ body })
@@ -1331,44 +1207,16 @@ ${Array.from({length:6}, (_,i) => {
       atts: o.att.map(a => ({ id: a.id, mime: a.mime || 'application/octet-stream', name: a.name || '', w: a.w, h: a.h, size: a.size, thumbId: a.thumb?.id || a.id, blur: a.blur })),
     };
   }
-  _extOf(name) { return ((name || '').split('.').pop() || '').toLowerCase(); }
-  // Тип вложения по РАСШИРЕНИЮ имени (приоритет) и mime. pibot/боты иногда шлют
-  // видео с mime image/png — расширение надёжнее. → 'image'|'video'|'audio'|'file'.
-  _attKind(a) {
-    const e = this._extOf(a && a.name);
-    if (['mp4','mov','webm','m4v','avi','mkv','ogv'].includes(e)) return 'video';
-    if (['mp3','wav','ogg','m4a','aac','opus','flac'].includes(e)) return 'audio';
-    if (['png','jpg','jpeg','gif','webp','bmp','heic','heif','avif','svg'].includes(e)) return 'image';
-    const m = (a && a.mime) || '';
-    if (m.startsWith('video/')) return 'video';
-    if (m.startsWith('audio/')) return 'audio';
-    if (m.startsWith('image/')) return 'image';
-    return 'file';
-  }
-  // Корректный mime по расширению (для blob video/audio — иначе плеер не сыграет mp4 с mime image/png)
-  _mimeFor(a) {
-    const e = this._extOf(a && a.name);
-    const map = { mp4:'video/mp4', mov:'video/quicktime', webm:'video/webm', m4v:'video/mp4', mkv:'video/x-matroska', ogv:'video/ogg',
-      mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', m4a:'audio/mp4', aac:'audio/aac', opus:'audio/opus', flac:'audio/flac' };
-    return map[e] || (a && a.mime) || 'application/octet-stream';
-  }
-  _isVisual(mime) { return (mime || '').startsWith('image/'); } // legacy (по mime)
-  _fmtSize(n) {
-    if (!n) return '';
-    if (n < 1024) return n + ' B';
-    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
-    return (n / 1024 / 1024).toFixed(1) + ' MB';
-  }
   // HTML не-картиночного вложения: видео/аудио — inline-плеер, прочее — карточка со скачиванием
   _attFileHtml(a) {
-    const kind = this._attKind(a);
-    const mime = this._mimeFor(a); // корректный mime (расширение приоритетнее — pibot врёт image/png на mp4)
+    const kind = attKind(a);
+    const mime = mimeFor(a); // корректный mime (расширение приоритетнее — pibot врёт image/png на mp4)
     if (kind === 'video') return `<video class="att-media" data-full="${a.id}" data-mime="${mime}" controls preload="metadata" playsinline></video>`;
     if (kind === 'audio') return `<audio class="att-media" data-full="${a.id}" data-mime="${mime}" controls preload="none"></audio>`;
     const ext = (a.name.split('.').pop() || '').slice(0, 4).toUpperCase();
-    return `<div class="att-file" data-full="${a.id}" data-mime="${mime}" data-name="${this._escapeHtml(a.name)}" title="Скачать">
+    return `<div class="att-file" data-full="${a.id}" data-mime="${mime}" data-name="${escapeHtml(a.name)}" title="Скачать">
         <div class="att-file-icon">${ext || '📄'}</div>
-        <div class="att-file-meta"><div class="att-file-name">${this._escapeHtml(a.name || 'файл')}</div><div class="att-file-size">${this._fmtSize(a.size)}</div></div>
+        <div class="att-file-meta"><div class="att-file-name">${escapeHtml(a.name || 'файл')}</div><div class="att-file-size">${formatSize(a.size)}</div></div>
       </div>`;
   }
   // Скачать вложение (decrypt → download)
@@ -1390,8 +1238,8 @@ ${Array.from({length:6}, (_,i) => {
     const imgAttr = cached ? ` src="${cached}" class="att-img shown"` : ' class="att-img"';
     // blur-плейсхолдер виден мгновенно (если ещё не загружена реальная картинка)
     const blurLayer = (a.blur && !cached) ? `<div class="att-blur" style="background-image:url('${a.blur}')"></div>` : '';
-    return `<div class="att-box" style="${style}" data-thumb="${a.thumbId}" data-full="${a.id}" data-mime="${a.mime}" data-hasthumb="${hasThumb}"${loadedAttr} title="${this._escapeHtml(a.name)}">
-          ${blurLayer}<img${imgAttr} decoding="async" alt="${this._escapeHtml(a.name)}">
+    return `<div class="att-box" style="${style}" data-thumb="${a.thumbId}" data-full="${a.id}" data-mime="${a.mime}" data-hasthumb="${hasThumb}"${loadedAttr} title="${escapeHtml(a.name)}">
+          ${blurLayer}<img${imgAttr} decoding="async" alt="${escapeHtml(a.name)}">
           <div class="att-progress${cached ? ' hidden' : ''}"><div class="att-bar"></div></div>
         </div>`;
   }
@@ -1402,11 +1250,11 @@ ${Array.from({length:6}, (_,i) => {
     const imgs = ps.filter(p => p.isImage), files = ps.filter(p => !p.isImage);
     let inner = '';
     if (imgs.length === 1) {
-      const d = this._imgDims(imgs[0].w, imgs[0].h);
+      const d = fitDimensions(imgs[0].w, imgs[0].h);
       const st = d ? `width:${d.w}px;height:${d.h}px` : 'width:200px;height:160px';
       inner += `<div class="att-box" data-loaded="1" style="${st}"><img class="att-img shown" src="${imgs[0].url}"></div>`;
     } else if (imgs.length > 1) {
-      const lay = this._albumLayout(imgs.map(p => (p.w && p.h) ? p.w / p.h : 1));
+      const lay = albumLayout(imgs.map(p => (p.w && p.h) ? p.w / p.h : 1));
       inner += `<div class="att-gallery" style="position:relative;width:${lay.width}px;height:${lay.height}px">${
         imgs.map((p, i) => { const r = lay.items[i];
           return `<div class="att-box" data-loaded="1" style="position:absolute;left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px"><img class="att-img shown" src="${p.url}"></div>`;
@@ -1414,110 +1262,22 @@ ${Array.from({length:6}, (_,i) => {
     }
     inner += files.map(p => {
       const ext = ((p.name || '').split('.').pop() || '').slice(0, 4).toUpperCase();
-      return `<div class="att-file"><div class="att-file-icon">${ext || '📄'}</div><div class="att-file-meta"><div class="att-file-name">${this._escapeHtml(p.name || 'файл')}</div><div class="att-file-size">${this._fmtSize(p.size)}</div></div></div>`;
+      return `<div class="att-file"><div class="att-file-icon">${ext || '📄'}</div><div class="att-file-meta"><div class="att-file-name">${escapeHtml(p.name || 'файл')}</div><div class="att-file-size">${formatSize(p.size)}</div></div></div>`;
     }).join('');
     const pct = Math.round((m._progress || 0) * 100);
-    const cap = m._caption ? `<div class="msg-text">${this._escapeHtml(m._caption)}</div>` : '';
+    const cap = m._caption ? `<div class="msg-text">${escapeHtml(m._caption)}</div>` : '';
     // Текстовое сообщение (без вложений) — показываем текст сразу
-    const textHtml = !inner && !cap && m.body ? `<div class="msg-text">${this._escapeHtml(this._decrypt(m.body, m._plaintext))}</div>` : '';
+    const textHtml = !inner && !cap && m.body ? `<div class="msg-text">${escapeHtml(this._decrypt(m.body, m._plaintext))}</div>` : '';
     return `<div class="msg-row mine">
       <div class="chat-bubble mine sending">
         ${inner ? `<div class="att-wrap att-sending">${inner}<div class="sending-overlay">Отправка ${pct}%</div></div>` : ''}
         ${cap}
         ${textHtml}
-        <span class="time">${this._escapeHtml(new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}))} ${m._sending ? '<span class="status sending" title="Отправляется">🕐</span>' : '<span class="status failed" title="Не отправлено">⚠</span>'}</span>
+        <span class="time">${escapeHtml(new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}))} ${m._sending ? '<span class="status sending" title="Отправляется">🕐</span>' : '<span class="status failed" title="Не отправлено">⚠</span>'}</span>
       </div></div>`;
   }
 
-  // Мозаичная раскладка альбома (порт алгоритма Telegram/tdesktop): спец-кейсы
-  // для 2/3/4 по пропорциям + justified-rows для 5+. Возвращает {items:[{x,y,w,h}], width, height}.
-  _albumLayout(ratiosIn, maxW = 320, maxH = 320, spacing = 2) {
-    const n = ratiosIn.length;
-    const ratios = ratiosIn.map(r => (r && r > 0) ? r : 1);
-    const proportions = ratios.map(r => r > 1.2 ? 'w' : (r < 0.8 ? 'n' : 'q')).join('');
-    const avg = ratios.reduce((s, r) => s + r, 0) / n;
-    const items = [];
-    const R = (x) => Math.round(x);
-    const push = (x, y, w, h) => items.push({ x: R(x), y: R(y), w: R(w), h: R(h) });
 
-    if (n === 2) {
-      if (proportions === 'ww' && avg > 1.4 && (ratios[1] - ratios[0]) < 0.2) {
-        const w = maxW, h0 = w / ratios[0], h1 = w / ratios[1]; // две строки на всю ширину
-        push(0, 0, w, h0); push(0, h0 + spacing, w, h1);
-        return { items, width: maxW, height: R(h0 + spacing + h1) };
-      }
-      if (proportions === 'ww' || proportions === 'qq') {
-        const w = (maxW - spacing) / 2, h = Math.min(w / ratios[0], w / ratios[1]); // 50/50
-        push(0, 0, w, h); push(w + spacing, 0, w, h);
-        return { items, width: maxW, height: R(h) };
-      }
-      const h = (maxW - spacing) / (ratios[0] + ratios[1]); // разные ширины, общая высота
-      push(0, 0, h * ratios[0], h); push(h * ratios[0] + spacing, 0, h * ratios[1], h);
-      return { items, width: maxW, height: R(h) };
-    }
-
-    if (n === 3) {
-      if (proportions[0] === 'n' || ratios[0] < avg) {
-        const H = maxH, rH = (H - spacing) / 2; // большая слева, две стопкой справа
-        const rightW = Math.max(rH * ratios[1], rH * ratios[2]);
-        const leftW = Math.max(maxW * 0.5, maxW - spacing - rightW);
-        const rw = maxW - spacing - leftW;
-        push(0, 0, leftW, H);
-        push(leftW + spacing, 0, rw, rH);
-        push(leftW + spacing, rH + spacing, rw, rH);
-        return { items, width: maxW, height: H };
-      }
-      const topH = Math.min(maxW / ratios[0], maxH * 0.66); // верхняя на всю ширину, две снизу
-      const bw = (maxW - spacing) / 2, bh = Math.min(bw / ratios[1], bw / ratios[2]);
-      push(0, 0, maxW, topH);
-      push(0, topH + spacing, bw, bh);
-      push(bw + spacing, topH + spacing, bw, bh);
-      return { items, width: maxW, height: R(topH + spacing + bh) };
-    }
-
-    if (n === 4) {
-      if (proportions[0] === 'w') {
-        const topH = Math.min(maxW / ratios[0], maxH * 0.66); // верхняя на всю ширину, три снизу
-        const h2 = (maxW - 2 * spacing) / (ratios[1] + ratios[2] + ratios[3]);
-        const w1 = h2 * ratios[1], w2 = h2 * ratios[2], w3 = h2 * ratios[3];
-        push(0, 0, maxW, topH);
-        push(0, topH + spacing, w1, h2);
-        push(w1 + spacing, topH + spacing, w2, h2);
-        push(w1 + w2 + 2 * spacing, topH + spacing, w3, h2);
-        return { items, width: maxW, height: R(topH + spacing + h2) };
-      }
-      const H = maxH, rH = (H - 2 * spacing) / 3; // большая слева, три стопкой справа
-      const rightW = Math.max(rH * ratios[1], rH * ratios[2], rH * ratios[3]);
-      const leftW = Math.max(maxW * 0.5, maxW - spacing - rightW);
-      const rw = maxW - spacing - leftW;
-      push(0, 0, leftW, H);
-      for (let i = 0; i < 3; i++) push(leftW + spacing, i * (rH + spacing), rw, rH);
-      return { items, width: maxW, height: H };
-    }
-
-    // 5+: justified rows (ряды на всю ширину, высота из суммы пропорций ряда)
-    const rows = []; let cur = [], curR = 0;
-    const rowAspect = maxW / (maxH / 2);
-    for (let i = 0; i < n; i++) { cur.push(ratios[i]); curR += ratios[i]; if (curR >= rowAspect) { rows.push(cur); cur = []; curR = 0; } }
-    if (cur.length) rows.push(cur);
-    let y = 0;
-    for (const row of rows) {
-      const rr = row.reduce((s, r) => s + r, 0);
-      const rowH = (maxW - spacing * (row.length - 1)) / rr;
-      let x = 0;
-      for (const r of row) { push(x, y, rowH * r, rowH); x += rowH * r + spacing; }
-      y += rowH + spacing;
-    }
-    return { items, width: maxW, height: R(y - spacing) };
-  }
-
-  // Размер картинки, вписанный в лимиты с сохранением пропорций (как telegram-tt
-  // calculateDimensions) — резервирует место ДО загрузки, чтобы лента не прыгала.
-  _imgDims(w, h, maxW = 260, maxH = 320) {
-    if (!w || !h || w <= 0 || h <= 0) return null;
-    const r = Math.min(maxW / w, maxH / h, 1);
-    return { w: Math.round(w * r), h: Math.round(h * r) };
-  }
 
   // IndexedDB-кэш расшифрованных байт (динамический import — не тянуть idb в терминал)
   async _idbStore() {
@@ -1562,7 +1322,7 @@ ${Array.from({length:6}, (_,i) => {
       return url;
     }
     if (!this._roomKeyRaw) return null;
-    const enc = await this._fetchWithProgress(BASE + `/rooms/${this._roomId}/attachments/${attId}`, onProgress);
+    const enc = await this._fetchWithProgress(getBase() + `/rooms/${this._roomId}/attachments/${attId}`, onProgress);
     const plain = decryptBlob(enc, this._roomKeyRaw);
     if (!plain) return null;
     this._idbSet(attId, plain); // fire-and-forget
@@ -1593,17 +1353,17 @@ ${Array.from({length:6}, (_,i) => {
     const CHUNK = 512 * 1024;
     const auth = { Authorization: 'Bearer ' + this._token };
     if (enc.length <= CHUNK) {
-      const r = await this._postRetry(BASE + `/rooms/${this._roomId}/attachments`, {
+      const r = await this._postRetry(getBase() + `/rooms/${this._roomId}/attachments`, {
         method: 'POST', headers: { ...auth, 'Content-Type': 'application/octet-stream' }, body: enc });
       if (onProgress) onProgress(1);
       return { id: (await r.json()).attachment_id, mime, name, w, h };
     }
-    const ir = await this._postRetry(BASE + `/rooms/${this._roomId}/attachments/init`, { method: 'POST', headers: auth });
+    const ir = await this._postRetry(getBase() + `/rooms/${this._roomId}/attachments/init`, { method: 'POST', headers: auth });
     const id = (await ir.json()).attachment_id;
     const total = Math.ceil(enc.length / CHUNK);
     for (let i = 0; i < total; i++) {
       const chunk = enc.subarray(i * CHUNK, Math.min((i + 1) * CHUNK, enc.length));
-      await this._postRetry(BASE + `/rooms/${this._roomId}/attachments/${id}/chunks?chunk=${i}&total=${total}`, {
+      await this._postRetry(getBase() + `/rooms/${this._roomId}/attachments/${id}/chunks?chunk=${i}&total=${total}`, {
         method: 'POST', headers: { ...auth, 'Content-Type': 'application/octet-stream' }, body: chunk });
       if (onProgress) onProgress((i + 1) / total);
     }
@@ -1714,7 +1474,7 @@ ${Array.from({length:6}, (_,i) => {
           media = `<img class="sd-thumb"${src}${data}>`;
         } else {
           const ext = ((name || '').split('.').pop() || '').slice(0, 4).toUpperCase();
-          media = `<div class="sd-thumb sd-fileicon">${ext || '📄'}<span>${this._escapeHtml(name || 'файл')}</span></div>`;
+          media = `<div class="sd-thumb sd-fileicon">${ext || '📄'}<span>${escapeHtml(name || 'файл')}</span></div>`;
         }
         return `<div class="sd-item">${media}${del}</div>`;
       }).join('');
@@ -1763,7 +1523,7 @@ ${Array.from({length:6}, (_,i) => {
         }
         if (!atts.length) return;
         const body = encryptBody(JSON.stringify({ caption, att: atts }), this._roomKeyRaw);
-        const r = await fetch(BASE + `/rooms/${this._roomId}/messages/${id}`, {
+        const r = await fetch(getBase() + `/rooms/${this._roomId}/messages/${id}`, {
           method: 'PATCH', headers: { 'Authorization': 'Bearer ' + this._token, 'Content-Type': 'application/json' },
           body: JSON.stringify({ body }) });
         if (!r.ok) throw new Error(`edit ${r.status}`);
@@ -1813,7 +1573,7 @@ ${Array.from({length:6}, (_,i) => {
       if (!atts.length) { this._removePending(pmsg); return; }
       pmsg._attIds = new Set(atts.map(a => a.id)); // для дедупа при SSE-эхо
       const body = encryptBody(JSON.stringify({ caption, att: atts }), this._roomKeyRaw);
-      await fetch(BASE + `/rooms/${this._roomId}/messages`, {
+      await fetch(getBase() + `/rooms/${this._roomId}/messages`, {
         method: 'POST', headers: { 'Authorization': 'Bearer ' + this._token, 'Content-Type': 'application/json' },
         body: JSON.stringify({ body }) });
       // pending снимется в _handleIncoming когда придёт реальное сообщение по SSE
@@ -2021,38 +1781,7 @@ ${Array.from({length:6}, (_,i) => {
       this._attUrl(fullId, mime, onProgress).then(u => u ? show(u) : fail()).catch(e => { console.error('att full:', e); fail(); });
     }
   }
-  _escapeHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-  // Markdown → безопасный HTML (как telegram web). Сначала escape, потом теги —
-  // markdown накладывается на уже экранированный текст, XSS невозможен.
-  _md(text) {
-    let s = this._escapeHtml(text || '');
-    const blocks = [];
-    // ```code block``` и `inline code` — вынимаем, чтобы внутри не парсить markdown
-    s = s.replace(/```([\s\S]*?)```/g, (m, c) => { blocks.push(`<pre>${c.replace(/^\n|\n$/g, '')}</pre>`); return `\u0001${blocks.length - 1}\u0001`; });
-    s = s.replace(/`([^`\n]+)`/g, (m, c) => { blocks.push(`<code>${c}</code>`); return `\u0001${blocks.length - 1}\u0001`; });
-    // ссылки [текст](url) — только http(s)
-    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, t, u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`);
-    // автолинк голых URL
-    s = s.replace(/(^|[\s])(https?:\/\/[^\s<]+)/g, (m, pre, u) => `${pre}<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
-    s = s.replace(/\*\*([^\n]+?)\*\*/g, '<strong>$1</strong>');     // **bold**
-    s = s.replace(/__([^\n]+?)__/g, '<strong>$1</strong>');         // __bold__
-    s = s.replace(/(^|[^\w*])\*([^\s*][^*\n]*?)\*(?!\w)/g, '$1<em>$2</em>'); // *italic*
-    s = s.replace(/(^|[^\w_])_([^\s_][^_\n]*?)_(?!\w)/g, '$1<em>$2</em>');   // _italic_
-    s = s.replace(/~~([^\n]+?)~~/g, '<s>$1</s>');                    // ~~strike~~
-    s = s.replace(/\|\|([^\n]+?)\|\|/g, '<span class="spoiler">$1</span>'); // ||spoiler||
-    s = s.replace(/\u0001(\d+)\u0001/g, (m, i) => blocks[+i]); // вернуть code/pre
-    return s;
-  }
-  _dayKey(iso) { const d = new Date(iso); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; }
-  _dayLabel(iso) {
-    const d = new Date(iso), now = new Date();
-    const same = (a,b) => a.getFullYear()===b.getFullYear() && a.getMonth()===b.getMonth() && a.getDate()===b.getDate();
-    if (same(d,now)) return 'Сегодня';
-    const yest = new Date(now); yest.setDate(now.getDate()-1);
-    if (same(d,yest)) return 'Вчера';
-    return d.toLocaleDateString('ru-RU', {day:'numeric',month:'long'});
-  }
   _readersOf(msgId) {
     const readers = [];
     for (const [uid, last] of Object.entries(this.reads)) {

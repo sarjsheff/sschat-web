@@ -1,8 +1,7 @@
 // room-info.js — Web Component <room-info>: настройки комнаты (Telegram Web style).
 // Атрибуты: token, roomid, roomname, ownerid, userid, muted. События: room-info:close, room-info:deleted, room-info:mute-toggled.
 
-const DEFAULT_BASE = import.meta.env?.VITE_API_BASE || '';   // см. .env.example
-const BASE = (() => { try { return localStorage.getItem('sschat-base-url') || DEFAULT_BASE; } catch { return DEFAULT_BASE; } })();
+import { getBase } from './config.js';
 
 /** Resize image file to max W×H, return JPEG as Uint8Array. Keeps aspect ratio. */
 async function resizeImage(file, maxW, maxH) {
@@ -59,7 +58,7 @@ class RoomInfo extends HTMLElement {
   }
 
   async _api(path, opts = {}) {
-    const r = await fetch(BASE + path, { ...opts, headers: { Authorization: 'Bearer ' + this._token, ...(opts.headers || {}) } });
+    const r = await fetch(getBase() + path, { ...opts, headers: { Authorization: 'Bearer ' + this._token, ...(opts.headers || {}) } });
     if (!r.ok) {
       const body = await r.text().catch(() => '');
       let msg = `HTTP ${r.status}`;
@@ -71,11 +70,19 @@ class RoomInfo extends HTMLElement {
   }
 
   async _load() {
-    try { this.members = (await this._api(`/rooms/${this._roomId}/members`)) || []; } catch (e) { console.error('members', e); }
-    try { this.allUsers = (await this._api(`/users`)) || []; } catch (e) { console.error('users', e); }
-    try { this.bots = (await this._api(`/rooms/${this._roomId}/bots`)) || []; } catch (e) { console.error('roomBots', e); }
-    try { this.myBots = (await this._api(`/bots`)) || []; } catch (e) { console.error('myBots', e); }
-    // Resolve member names (fire-and-forget — names update via re-render)
+    // Четыре независимых запроса — параллельно; сбой любого не рушит остальные.
+    const load = (path, label) => this._api(path).catch(e => { console.error(label, e); return null; });
+    const [members, users, bots, myBots] = await Promise.all([
+      load(`/rooms/${this._roomId}/members`, 'members'),
+      load('/users', 'users'),
+      load(`/rooms/${this._roomId}/bots`, 'roomBots'),
+      load('/bots', 'myBots'),
+    ]);
+    this.members = members || [];
+    this.allUsers = users || [];
+    this.bots = bots || [];
+    this.myBots = myBots || [];
+    // Имена подтягиваются фоном — каждое обновляет разметку по готовности
     for (const m of this.members) {
       if (!this.names[m.user_id]) this._resolveName(m.user_id).then(() => this._render());
     }

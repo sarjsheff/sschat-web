@@ -1,5 +1,6 @@
 import { LitElement, html, css } from 'lit';
-import { api, getToken } from './api.js';
+import { api } from './api.js';
+import { getBase } from './config.js';
 import './lib/ui/s-button.js';
 import './lib/ui/s-input.js';
 
@@ -23,7 +24,7 @@ class LoginView extends LitElement {
 
   constructor() {
     super();
-    this._url = localStorage.getItem('sschat-base-url') || import.meta.env?.VITE_API_BASE || '';
+    this._url = getBase();
     this._username = ''; this._password = ''; this._error = ''; this._busy = false;
   }
 
@@ -53,7 +54,7 @@ class LoginView extends LitElement {
       await api.setBaseURL(this._url.trim());
       const resp = await api.login(this._username.trim(), this._password);
       const cid = resp.challenge_id; // только строка, не весь объект
-      this.dispatchEvent(new CustomEvent('login:done', { detail: { cid, password: this._password }, bubbles: true, composed: true }));
+      this.dispatchEvent(new CustomEvent('login:done', { detail: { cid }, bubbles: true, composed: true }));
     } catch (e) { this._error = String(e); this._busy = false; }
   }
 }

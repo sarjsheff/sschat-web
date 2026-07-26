@@ -1,31 +1,34 @@
-// api.js — HTTP-клиент для sschat сервера (замена Tauri invoke на fetch)
+// api.js — HTTP-клиент sschat-сервера.
+//
+// Здесь только то, что вызывается из компонентов. chat-view и room-info ходят
+// в сеть своим fetch (самодостаточность: chat-view импортируется терминальными
+// тестами со стабами DOM, статический импорт этого модуля потянул бы idb-keyval).
 import { BUILD_INFO } from './build-info.js';
-
-// Адрес сервера: сборочный VITE_API_BASE (см. .env.example), поверх него —
-// runtime-переопределение из настроек (localStorage). Пусто → login-экран
-// попросит ввести адрес вручную.
-const DEFAULT_BASE = import.meta.env?.VITE_API_BASE || '';
-const BASE = (() => {
-  try { return localStorage.getItem('sschat-base-url') || DEFAULT_BASE; }
-  catch { return DEFAULT_BASE; }
-})();
-
-export function setBaseURL(url) {
-  try { localStorage.setItem('sschat-base-url', url); } catch {}
-}
+import { getBase, setBaseURL } from './config.js';
 
 export function getToken() {
   try { return localStorage.getItem('sschat-token'); } catch { return null; }
 }
 
 export function setToken(t) {
-  try { localStorage.setItem('sschat-token', t); } catch {}
+  try {
+    if (t === null || t === undefined) localStorage.removeItem('sschat-token');
+    else localStorage.setItem('sschat-token', t);
+  } catch {}
+}
+
+/** Payload JWT текущего токена (base64url) или null. */
+function tokenPayload() {
+  try {
+    const part = getToken().split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(atob(part.padEnd(part.length + (4 - part.length % 4) % 4, '=')));
+  } catch { return null; }
 }
 
 async function request(method, path, body) {
   const headers = { 'Authorization': `Bearer ${getToken()}` };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  const resp = await fetch(BASE + path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
+  const resp = await fetch(getBase() + path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
   const text = await resp.text();
   if (!resp.ok) {
     let msg = text;
@@ -35,370 +38,169 @@ async function request(method, path, body) {
   return text ? JSON.parse(text) : null;
 }
 
-async function get(path) { return request('GET', path); }
-async function post(path, body) { return request('POST', path, body); }
-async function patch(path, body) { return request('PATCH', path, body); }
-async function del(path) { return request('DELETE', path); }
+const get = (path) => request('GET', path);
+const post = (path, body) => request('POST', path, body);
+const patch = (path, body) => request('PATCH', path, body);
+const del = (path) => request('DELETE', path);
 
-// --- E2E roomKey cache (разделяется между компонентами) ---
+// --- E2E: identity и кеш комнатных ключей (общий на все компоненты) ---
 let _identityPriv = null;
 let _userId = null;
 const _roomKeys = new Map();
 const _roomKeyNotFound = new Set();
 
 export function setIdentity(priv, uid) { _identityPriv = priv; _userId = uid; }
-export function getIdentity() { return _identityPriv; }
-export function setRoomKey(roomId, key) { _roomKeys.set(roomId, key); }
-export function getRoomKey(roomId) { return _roomKeys.get(roomId); }
 
-async function _ensureRoomKey(roomId) {
+/** Комнатный ключ из кеша, иначе распаковать свою копию с сервера. */
+async function ensureKey(roomId) {
   if (_roomKeys.has(roomId)) return _roomKeys.get(roomId);
-  if (_roomKeyNotFound.has(roomId)) return null;
-  if (!_identityPriv) return null;
+  if (_roomKeyNotFound.has(roomId) || !_identityPriv) return null;
   try {
     const { ensureRoomKey } = await import('./room-key.js');
     const key = await ensureRoomKey(roomId, _identityPriv);
-    if (key) {
-      _roomKeys.set(roomId, key);
-      // First time we get a key — distribute to all members
-      api.redistributeRoomKey(roomId).catch(() => {});
-      return key;
-    }
+    if (key) { _roomKeys.set(roomId, key); return key; }
     _roomKeyNotFound.add(roomId);
   } catch {}
   return null;
 }
 
-async function _createRoomKey(roomId) {
-  console.log('_createRoomKey called, identityPriv:', !!_identityPriv, 'userId:', !!_userId);
-  if (!_identityPriv || !_userId) {
-    console.error('_createRoomKey: no identity or userId — key NOT created!');
-    return;
-  }
+/** Сгенерировать ключ новой комнаты, завернуть себе и раздать участникам. */
+async function createRoomKey(roomId) {
+  if (!_identityPriv || !_userId) { console.error('createRoomKey: нет identity/userId — ключ не создан'); return; }
   const roomKey = crypto.getRandomValues(new Uint8Array(32));
   const { deriveKEK } = await import('./crypto.js');
   const { loadOrCreateIdentity } = await import('./identity.js');
   const id = await loadOrCreateIdentity();
-  const pub = id.pub;
 
-  const kek = deriveKEK(id.priv, pub, roomId);
+  const kek = deriveKEK(id.priv, id.pub, roomId);
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const { gcm } = await import('@noble/ciphers/aes.js');
   const wrapped = gcm(kek, nonce).encrypt(roomKey);
 
   await post(`/rooms/${roomId}/keys`, [{
     user_id: _userId,
-    wrapped: btoa(String.fromCharCode(...wrapped)),
-    nonce: btoa(String.fromCharCode(...nonce)),
-    sender_pub: btoa(String.fromCharCode(...pub)),
+    wrapped: b64(wrapped),
+    nonce: b64(nonce),
+    sender_pub: b64(id.pub),
   }]);
 
   const cryptoKey = await crypto.subtle.importKey('raw', roomKey, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
   _roomKeys.set(roomId, { key: cryptoKey, raw: roomKey });
-  console.log('room key created for', roomId.slice(0,8));
-  // Wrap for all room members
   api.redistributeRoomKey(roomId).catch(() => {});
 }
 
-async function _retryRoomKeyInBackground(roomId) {
-  const { ensureRoomKey } = await import('./room-key.js');
-  for (let i = 0; i < 5; i++) {
-    await new Promise(r => setTimeout(r, 2000));
-    try {
-      const key = await ensureRoomKey(roomId, _identityPriv);
-      if (key) {
-        _roomKeys.set(roomId, key);
-        // Триггерим перерисовку через кастомное событие
-        window.dispatchEvent(new CustomEvent('sschat:roomkey_ready', { detail: { roomId } }));
-        return;
-      }
-    } catch {}
-  }
+function b64(bytes) { return btoa(String.fromCharCode(...bytes)); }
+function fromB64(s) { return new Uint8Array([...atob(s)].map(c => c.charCodeAt(0))); }
+
+/** Публичный ключ получателя: identity-backup, иначе pub_key любого его устройства. */
+async function recipientPubKey(userId) {
+  const resp = await get(`/users/${userId}/identity-pub`).catch(() => null);
+  if (resp?.pub_key) return resp.pub_key;
+  const devices = await get(`/users/${userId}/devices`).catch(() => null);
+  for (const d of devices || []) if (d.pub_key?.length === 44) return d.pub_key;
+  return null;
 }
 
 export const api = {
-  setBaseURL: (url) => { try { localStorage.setItem('sschat-base-url', url); } catch {} },
+  setBaseURL,
 
-  // State (бывший Tauri getState)
+  // --- Состояние сессии ---
   getState: async () => {
-    const token = getToken();
-    if (!token) return { baseURL: BASE, authenticated: false, me: null };
+    if (!getToken()) return { baseURL: getBase(), authenticated: false, me: null };
     try {
-      const me = await get('/me');
-      return { baseURL: BASE, authenticated: true, me };
+      return { baseURL: getBase(), authenticated: true, me: await get('/me') };
     } catch {
       setToken(null);
-      return { baseURL: BASE, authenticated: false, me: null };
+      return { baseURL: getBase(), authenticated: false, me: null };
     }
   },
-
-  // Build info
   getClientVersion: () => BUILD_INFO,
-  // Auth
+  /** ID устройства текущей сессии (claim did в JWT) — чтобы отметить его в списке. */
+  currentDeviceID: () => tokenPayload()?.did || null,
+
+  // --- Аутентификация ---
   getServerSettings: () => get('/settings'),
   login: (username, password) => post('/login', { username, password }),
   submitCode: async (challengeId, code) => {
     const cid = (typeof challengeId === 'string' ? challengeId : challengeId?.challenge_id) || challengeId;
     const resp = await post('/auth/code', { challenge_id: cid, code, device_name: 'sschat-web', platform: 'web' });
-    if (resp.token) { setToken(resp.token); }
+    if (resp.token) setToken(resp.token);
     return resp;
   },
-  logout: () => { try { localStorage.removeItem('sschat-token'); } catch {} },
+  logout: () => setToken(null),
   me: () => get('/me'),
+  changePassword: (oldPassword, newPassword) => post('/me/password', { old_password: oldPassword, new_password: newPassword }),
 
-  // Rooms
+  // --- Комнаты ---
   listRooms: () => get('/rooms?limit=200'),
   createRoom: async (name) => {
     const room = await post('/rooms', { name });
-    // Генерируем и распространяем room key для новой комнаты
-    _createRoomKey(room.id).catch(e => console.error('createRoomKey failed:', e));
+    createRoomKey(room.id).catch(e => console.error('createRoomKey:', e));
     return room;
   },
-  deleteRoom: (id) => del(`/rooms/${id}`),
+  getRoomAvatarUrl: (roomId) => `${getBase()}/rooms/${roomId}/avatar`,
 
-  // Messages
-  loadOlderMessages: async (roomId, beforeId, limit = 100) => {
-    const msgs = await get(`/rooms/${roomId}/messages?before=${beforeId}&limit=${limit}`);
-    const rkEntry = _roomKeys.get(roomId) || await _ensureRoomKey(roomId);
-    const rk = rkEntry?.raw || rkEntry?.key || rkEntry;
-    const { decryptBody } = await import('./crypto.js');
-    const decrypted = [];
-    for (const m of msgs) {
-      if (rk) {
-        decrypted.push(decryptBody(m.body, rk) || '•••');
-      } else {
-        decrypted.push(m.body?.startsWith('{') ? '•••' : (m.body || ''));
-      }
-    }
-    return { messages: msgs, decrypted, has_more_older: msgs.length >= limit };
-  },
-
-  loadMessages: async (roomId, opts = {}) => {
-    let q = `limit=${opts.limit || 50}`;
-    if (opts.before) q += `&before=${opts.before}`;
-    if (opts.after) q += `&after=${opts.after}`;
-    const msgs = await get(`/rooms/${roomId}/messages?${q}`);
-    // Расшифровываем (как Rust load_messages)
-    const rkEntry = _roomKeys.get(roomId) || await _ensureRoomKey(roomId);
-    const rk = rkEntry?.raw || rkEntry?.key || rkEntry; // raw bytes for @noble/ciphers
-    const { decryptBody } = await import('./crypto.js');
-    const decrypted = [];
-    for (const m of msgs) {
-      if (rk) {
-        const plain = decryptBody(m.body, rk);
-        decrypted.push(plain || '•••');
-      } else {
-        decrypted.push(m.body?.startsWith('{') ? '•••' : (m.body || ''));
-      }
-    }
-    msgs.reverse(); // сервер отдаёт newest-first, клиент ждёт oldest-first
-    return { messages: msgs, decrypted, from_cache: false, has_more_older: msgs.length >= (opts.limit || 50) };
-  },
-  sendMessage: (roomId, body) => post(`/rooms/${roomId}/messages`, { body }),
-  editMessage: (roomId, msgId, body) => patch(`/rooms/${roomId}/messages/${msgId}`, { body }),
-  deleteMessage: (roomId, msgId) => del(`/rooms/${roomId}/messages/${msgId}`),
-  markRead: (roomId, msgId) => post(`/rooms/${roomId}/read`, { msg_id: msgId }),
-  sendTyping: (roomId) => post(`/rooms/${roomId}/typing`, {}).catch(() => {}),
-  muteRoom: (roomId) => put(`/rooms/${roomId}/mute`, {}),
-  unmuteRoom: (roomId) => del(`/rooms/${roomId}/mute`),
-
-  // Sync
-  deltaFetchMessages: async (roomId) => {
-    // Как в десктопе: fetch messages after latest_cached_id
-    const { getRoomMeta } = await import('./cache.js');
-    const meta = await getRoomMeta(roomId);
-    const last = meta.latest_cached_id;
-    return api.loadMessages(roomId, { after: last || '', limit: 500 });
-  },
-  syncMessages: (roomId, since) => get(`/rooms/${roomId}/sync?since=${since}&limit=200`),
-
-  // Users & Members
+  // --- Пользователи ---
   listUsers: () => get('/users'),
-  getUser: (id) => get(`/users/${id}`),
   listRoomMembers: (roomId) => get(`/rooms/${roomId}/members`),
-  addMemberToRoom: (roomId, userId) => post(`/rooms/${roomId}/members/${userId}`),
-  removeMemberFromRoom: (roomId, userId) => del(`/rooms/${roomId}/members/${userId}`),
-  setMemberRole: (roomId, userId, role) => patch(`/rooms/${roomId}/members/${userId}`, { role }),
 
-  // Devices
+  // --- Устройства ---
   registerDevice: (pubKey) => post('/devices', { pub_key: pubKey, platform: 'web', name: 'sschat-web' }),
   listMyDevices: () => get('/devices'),
   deleteDevice: (id) => del(`/devices/${id}`),
 
-  // Bots
+  // --- Боты ---
   listBots: () => get('/bots'),
   createBot: (username, displayName) => post('/bots', { username, display_name: displayName }),
   deleteBot: (id) => del(`/bots/${id}`),
   regenerateBotToken: (id) => post(`/bots/${id}/regenerate-token`),
-  listRoomBots: (roomId) => get(`/rooms/${roomId}/bots`),
-  addBotToRoom: (roomId, botId) => post(`/rooms/${roomId}/bots/${botId}`),
-  removeBotFromRoom: (roomId, botId) => del(`/rooms/${roomId}/bots/${botId}`),
 
-  // Attachments
-  uploadAttachment: async (roomId, encryptedBytes) => {
-    const resp = await fetch(BASE + `/rooms/${roomId}/attachments`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${getToken()}`, 'Content-Type': 'application/octet-stream' },
-      body: encryptedBytes,
-    });
-    if (!resp.ok) throw new Error(`upload → ${resp.status}`);
-    const { attachment_id } = await resp.json();
-    return attachment_id;
-  },
-  downloadAttachment: async (roomId, attId) => {
-    const resp = await fetch(BASE + `/rooms/${roomId}/attachments/${attId}`, {
-      headers: { 'Authorization': `Bearer ${getToken()}` },
-    });
-    if (!resp.ok) throw new Error(`download → ${resp.status}`);
-    return new Uint8Array(await resp.arrayBuffer());
-  },
+  // --- Комнатные ключи (E2E) ---
+  getMyRoomKey: (roomId) => get(`/rooms/${roomId}/keys/me`),
 
-  // Room avatar (публичное фото комнаты, как в Telegram)
-  uploadRoomAvatar: async (roomId, imageBytes) => {
-    const resp = await fetch(BASE + `/rooms/${roomId}/avatar`, {
-      method: 'PUT',
-      headers: { 'Authorization': `Bearer ${getToken()}`, 'Content-Type': 'application/octet-stream' },
-      body: imageBytes,
-    });
-    if (!resp.ok) throw new Error(`avatar upload → ${resp.status}`);
-    return resp.json();
-  },
-  getRoomAvatarUrl: (roomId) => `${BASE}/rooms/${roomId}/avatar`,
-  deleteRoomAvatar: async (roomId) => {
-    const resp = await fetch(BASE + `/rooms/${roomId}/avatar`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${getToken()}` },
-    });
-    if (!resp.ok) throw new Error(`avatar delete → ${resp.status}`);
-    return resp.json();
+  /** Завернуть ключ комнаты для всех её участников (после добавления устройства/участника). */
+  redistributeRoomKey: async (roomId) => {
+    const rkEntry = _roomKeys.get(roomId) || await ensureKey(roomId);
+    if (!rkEntry?.raw || !_identityPriv) return;
+    try {
+      const [members, users] = await Promise.all([api.listRoomMembers(roomId), api.listUsers()]);
+      const { deriveKEK } = await import('./crypto.js');
+      const { gcm } = await import('@noble/ciphers/aes.js');
+      const { loadOrCreateIdentity } = await import('./identity.js');
+      const id = await loadOrCreateIdentity();
+
+      const keys = [];
+      for (const m of members) {
+        const u = users.find(x => x.id === m.user_id);
+        if (!u || u.id === _userId) continue;
+        try {
+          const pubB64 = await recipientPubKey(u.id);
+          if (!pubB64) continue;                       // нет опубликованного ключа — пропускаем
+          const recipientPub = fromB64(pubB64);
+          if (recipientPub.length !== 32) continue;
+          const nonce = crypto.getRandomValues(new Uint8Array(12));
+          const wrapped = gcm(deriveKEK(id.priv, recipientPub, roomId), nonce).encrypt(rkEntry.raw);
+          keys.push({ user_id: u.id, wrapped: b64(wrapped), nonce: b64(nonce), sender_pub: b64(id.pub) });
+        } catch {}
+      }
+      if (keys.length) await post(`/rooms/${roomId}/keys`, keys);
+    } catch (e) { console.error('redistributeRoomKey:', e.message); }
   },
 
-  // Room keys (E2E)
-  getMyRoomKey: async (roomId) => {
-    const resp = await get(`/rooms/${roomId}/keys/me`);
-    console.log('getMyRoomKey', roomId.slice(0,8), '→', resp ? 'ok' : 'null', 'wrapped:', !!resp?.wrapped);
-    return resp;
-  },
-  uploadRoomKeys: (roomId, keys) => post(`/rooms/${roomId}/keys`, keys),
-
-  // Identity backup
-  getIdentityBackup: () => get('/me/identity-backup'),
-  saveIdentityBackup: (blob) => post('/me/identity-backup', blob),
-  deleteIdentityBackup: () => del('/me/identity-backup'),
-
-  // Password
-  changePassword: (oldPassword, newPassword) => post('/me/password', { old_password: oldPassword, new_password: newPassword }),
-
-  // Reads
-  listRoomReads: (roomId) => get(`/rooms/${roomId}/reads`),
-
-  // Room key redistribution
-  uploadRoomKeys: (roomId, keys) => post(`/rooms/${roomId}/keys`, keys),
-
-  // Cache (вызывается из Chat.svelte)
-  cacheRead: async (roomId, userId, lastRead) => {
-    const { putRead } = await import('./cache.js');
-    return putRead(roomId, userId, lastRead);
-  },
-  getCachedReads: async (roomId) => {
-    const { getReads } = await import('./cache.js');
-    return getReads(roomId);
-  },
-  // iOS (Tauri): читаем APNs-токен (push.m записал в файл) через Rust invoke и
-  // POSTим на /devices. В обычном web — no-op (нет __TAURI__).
+  // --- iOS push ---
+  // push.m кладёт APNs-токен в файл, Rust отдаёт его через invoke. В вебе — no-op.
+  // Dedup по паре (device, token): после ре-логина device другой и токен нужно
+  // переслать, хотя его значение не изменилось.
   publishApnsToken: async () => {
     const t = globalThis.__TAURI__;
     if (!t?.core?.invoke) return false;
     let token;
     try { token = await t.core.invoke('read_apns_token'); } catch { return false; }
     if (!token) return false;
-    // Dedup по (did, token): did из JWT. Смена device (ре-логин → новый device
-    // row на сервере без токена) или смена apns-токена → шлем заново. Dedup
-    // только по значению токена терял пуши после ре-логина.
-    let did = '';
-    try {
-      const payload = getToken().split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-      did = JSON.parse(atob(payload)).did || '';
-    } catch {}
-    const sentKey = `${did}:${token}`;
-    if (localStorage.getItem('apns-token-sent') === sentKey) return true; // дубль — не шлём
+    const sentKey = `${tokenPayload()?.did || ''}:${token}`;
+    if (localStorage.getItem('apns-token-sent') === sentKey) return true;
     await post('/devices', { name: 'iphone', platform: 'ios', token });
     localStorage.setItem('apns-token-sent', sentKey);
     return true;
-  },
-  setRoomSeq: async (roomId, seq) => {
-    const { setRoomSeq } = await import('./cache.js');
-    return setRoomSeq(roomId, seq);
-  },
-  getRoomSeq: async (roomId) => {
-    const { getRoomSeq } = await import('./cache.js');
-    return getRoomSeq(roomId);
-  },
-
-  redistributeRoomKey: async (roomId) => {
-    // Wrap room key for ALL room members (users + bots)
-    const rkEntry = _roomKeys.get(roomId);
-    if (!rkEntry?.raw || !_identityPriv) return;
-    try {
-      const [members, users] = await Promise.all([
-        api.listRoomMembers(roomId),
-        api.listUsers(),
-      ]);
-      const { unwrapRoomKey, deriveKEK, generateIdentity } = await import('./crypto.js');
-      // Export room key as raw bytes
-      const roomKeyRaw = rkEntry.raw;
-      const { loadOrCreateIdentity } = await import('./identity.js');
-      const id = await loadOrCreateIdentity();
-      const priv = id.priv;
-      const pub = id.pub;
-
-      const keys = [];
-      for (const m of members) {
-        const u = users.find(x => x.id === m.user_id);
-        if (!u || u.id === _userId) continue; // skip self
-        // Get recipient's pub_key (identity backup for users, devices for bots)
-        try {
-          let resp = await get(`/users/${u.id}/identity-pub`);
-          let recipientPubB64 = resp?.pub_key;
-          if (!recipientPubB64) {
-            // Fallback: try devices (bots publish pub_key here)
-            const devs = await get(`/users/${u.id}/devices`);
-            if (devs?.length) {
-              for (const d of devs) {
-                if (d.pub_key && d.pub_key.length === 44) { recipientPubB64 = d.pub_key; break; }
-              }
-            }
-          }
-          if (!recipientPubB64) continue;
-          const recipientPub = new Uint8Array(atob(resp.pub_key).split('').map(c => c.charCodeAt(0)));
-          if (recipientPub.length !== 32) continue;
-          // Wrap room key for this recipient
-          const kek = deriveKEK(priv, recipientPub, roomId);
-          const nonce = crypto.getRandomValues(new Uint8Array(12));
-          const { gcm } = await import('@noble/ciphers/aes.js');
-          const wrapped = gcm(kek, nonce).encrypt(roomKeyRaw);
-          keys.push({
-            user_id: u.id,
-            wrapped: btoa(String.fromCharCode(...wrapped)),
-            nonce: btoa(String.fromCharCode(...nonce)),
-            sender_pub: btoa(String.fromCharCode(...pub)),
-          });
-        } catch (e) { /* skip users without identity backup */ }
-      }
-      if (keys.length > 0) {
-        await post(`/rooms/${roomId}/keys`, keys);
-        console.log('redistributed keys to', keys.length, 'members');
-        window.dispatchEvent(new CustomEvent('sschat:roomkey_ready', { detail: { roomId } }));
-      }
-    } catch (e) { console.error('redistributeRoomKey failed:', e.message); }
-  },
-
-  // E2E helpers (используются компонентами)
-  decryptIncoming: async (msg) => {
-    const rkEntry = _roomKeys.get(msg.room_id) || await _ensureRoomKey(msg.room_id);
-    const rk = rkEntry?.raw || rkEntry?.key || rkEntry;
-    if (!rk) return msg.body?.startsWith('{') ? '•••' : (msg.body || '');
-    const { decryptBody } = await import('./crypto.js');
-    return decryptBody(msg.body, rk) || '•••';
   },
 };

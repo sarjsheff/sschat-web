@@ -9,7 +9,7 @@ const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 function b64ToBytes(b64) { return new Uint8Array([...atob(b64)].map(c => c.charCodeAt(0))); }
 function bytesToB64(bytes) { return btoa(String.fromCharCode(...bytes)); }
 
-export function ulidToBytes(ulid) {
+function ulidToBytes(ulid) {
   const idx = (c) => { const i = ALPHABET.indexOf(c.toUpperCase()); if (i < 0) throw new Error('invalid ULID char: ' + c); return i; };
   if (ulid.length !== 26) throw new Error('ULID must be 26 chars');
   const out = new Uint8Array(16); let value = idx(ulid[0]) & 0b00111, bits = 3, outPos = 0;

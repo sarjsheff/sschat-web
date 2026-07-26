@@ -1,5 +1,5 @@
 import { LitElement, html } from 'lit';
-import { api, getToken } from './api.js';
+import { api } from './api.js';
 import './lib/ui/s-button.js';
 
 class SidebarView extends LitElement {

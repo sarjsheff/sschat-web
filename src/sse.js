@@ -1,12 +1,11 @@
 // sse.js — fetch-based SSE клиент с exponential backoff и сбросом при успехе.
 // Подписывается на /events, диспатчит кастомные события на window.
+import { getBase } from './config.js';
 
 export function connectSSE(token) {
   if (!token) return () => {};
 
-  const fallback = import.meta.env?.VITE_API_BASE || '';   // см. .env.example
-  const base = (() => { try { return localStorage.getItem('sschat-base-url') || fallback; } catch { return fallback; } })();
-  const url = base + '/events';
+  const url = getBase() + '/events';
   let aborted = false;
   let reconnectTimer = null;
   let backoff = 1000;
